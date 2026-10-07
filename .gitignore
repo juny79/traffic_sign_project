@@ -1,0 +1,31 @@
+# Python environments and caches
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# Local datasets and model artifacts (large / not intended for GitHub)
+data/
+outputs/
+*.keras
+*.h5
+
+# Generated notebook execution artifacts and logs
+executed_*.ipynb
+notebook_*.txt
+
+# Generated submission files; keep local unless explicitly needed
+submission*.csv
+
+# Local editor / OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Environment variables and credentials
+.env
+.env.*
+!.env.example
