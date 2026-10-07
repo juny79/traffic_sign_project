@@ -109,29 +109,62 @@ def make_dataset(
     batch_size: int,
     use_roi: bool = False,
     mixup_alpha: float = 0.0,
+    class_weight_power: float = 0.0,
 ) -> tf.data.Dataset:
     paths = [image_path(data_dir, p) for p in frame["Path"].astype(str)]
     labels = frame["ClassId"].to_numpy(dtype=np.int32)
+    use_sample_weights = training and class_weight_power > 0
+    if use_sample_weights:
+        counts = np.bincount(labels, minlength=NUM_CLASSES).astype(np.float64)
+        present = counts > 0
+        class_weights = np.ones(NUM_CLASSES, dtype=np.float64)
+        class_weights[present] = (
+            len(labels) / (np.sum(present) * counts[present])
+        ) ** class_weight_power
+        class_weights /= np.average(class_weights, weights=counts)
+        sample_weights = class_weights[labels].astype(np.float32)
     if use_roi:
         roi_values = frame.loc[:, list(ROI_COLUMNS)].to_numpy(dtype=np.float32)
-        ds = tf.data.Dataset.from_tensor_slices((paths, labels, roi_values))
-        ds = ds.map(
-            lambda p, y, r: (load_image(p, r), tf.one_hot(y, NUM_CLASSES)),
-            num_parallel_calls=tf.data.AUTOTUNE,
-        )
+        if use_sample_weights:
+            ds = tf.data.Dataset.from_tensor_slices(
+                (paths, labels, roi_values, sample_weights)
+            )
+            ds = ds.map(
+                lambda p, y, r, w: (
+                    load_image(p, r), tf.one_hot(y, NUM_CLASSES), w
+                ),
+                num_parallel_calls=tf.data.AUTOTUNE,
+            )
+        else:
+            ds = tf.data.Dataset.from_tensor_slices((paths, labels, roi_values))
+            ds = ds.map(
+                lambda p, y, r: (load_image(p, r), tf.one_hot(y, NUM_CLASSES)),
+                num_parallel_calls=tf.data.AUTOTUNE,
+            )
     else:
-        ds = tf.data.Dataset.from_tensor_slices((paths, labels))
-        ds = ds.map(
-            lambda p, y: (load_image(p), tf.one_hot(y, NUM_CLASSES)),
-            num_parallel_calls=tf.data.AUTOTUNE,
-        )
+        if use_sample_weights:
+            ds = tf.data.Dataset.from_tensor_slices(
+                (paths, labels, sample_weights)
+            )
+            ds = ds.map(
+                lambda p, y, w: (load_image(p), tf.one_hot(y, NUM_CLASSES), w),
+                num_parallel_calls=tf.data.AUTOTUNE,
+            )
+        else:
+            ds = tf.data.Dataset.from_tensor_slices((paths, labels))
+            ds = ds.map(
+                lambda p, y: (load_image(p), tf.one_hot(y, NUM_CLASSES)),
+                num_parallel_calls=tf.data.AUTOTUNE,
+            )
     if training:
         ds = ds.shuffle(len(frame), seed=SEED, reshuffle_each_iteration=True)
     ds = ds.batch(batch_size)
     if training and mixup_alpha > 0:
         alpha = tf.constant(mixup_alpha, dtype=tf.float32)
 
-        def mixup_batch(images: tf.Tensor, labels: tf.Tensor) -> tuple[tf.Tensor, tf.Tensor]:
+        def mixup_batch(batch: tuple[tf.Tensor, ...]) -> tuple[tf.Tensor, ...]:
+            images, labels = batch[0], batch[1]
+            sample_weights = batch[2] if len(batch) == 3 else None
             batch_count = tf.shape(images)[0]
             concentration = tf.fill([batch_count], alpha)
             gamma_a = tf.random.gamma([], concentration)
@@ -142,7 +175,13 @@ def make_dataset(
             label_weights = weights[:, None]
             mixed_images = images * image_weights + tf.gather(images, permutation) * (1.0 - image_weights)
             mixed_labels = labels * label_weights + tf.gather(labels, permutation) * (1.0 - label_weights)
-            return mixed_images, mixed_labels
+            if sample_weights is None:
+                return mixed_images, mixed_labels
+            mixed_sample_weights = (
+                sample_weights * weights
+                + tf.gather(sample_weights, permutation) * (1.0 - weights)
+            )
+            return mixed_images, mixed_labels, mixed_sample_weights
 
         ds = ds.map(mixup_batch, num_parallel_calls=tf.data.AUTOTUNE)
     return ds.prefetch(tf.data.AUTOTUNE)
@@ -163,9 +202,36 @@ def make_test_dataset(
     return ds.batch(batch_size).prefetch(tf.data.AUTOTUNE)
 
 
-def predict_with_tta(model: tf.keras.Model, image_ds: tf.data.Dataset) -> np.ndarray:
-    """원본과 약한 밝기 변화 두 가지의 예측 확률을 평균합니다."""
-    original_probabilities = model.predict(image_ds, verbose=0)
+def predict_models(
+    models: list[tf.keras.Model],
+    image_ds: tf.data.Dataset,
+    primary_weight: float = 0.9,
+) -> np.ndarray:
+    """각 모델 입력 크기에 맞춰 예측하고, 주 모델을 더 크게 반영합니다."""
+    probabilities = []
+    for model in models:
+        target_size = tuple(model.input_shape[1:3])
+        model_ds = image_ds
+        if target_size != IMG_SIZE:
+            model_ds = image_ds.map(
+                lambda images: tf.image.resize(images, target_size),
+                num_parallel_calls=tf.data.AUTOTUNE,
+            )
+        probabilities.append(model.predict(model_ds, verbose=0))
+    if len(probabilities) == 1:
+        return probabilities[0]
+    secondary_weight = (1.0 - primary_weight) / (len(probabilities) - 1)
+    weights = [primary_weight] + [secondary_weight] * (len(probabilities) - 1)
+    return np.average(probabilities, axis=0, weights=weights)
+
+
+def predict_with_tta(
+    models: list[tf.keras.Model],
+    image_ds: tf.data.Dataset,
+    primary_weight: float = 0.9,
+) -> np.ndarray:
+    """모델 앙상블에 원본·약한 밝기 변형 TTA를 적용합니다."""
+    original_probabilities = predict_models(models, image_ds, primary_weight)
     brighter_ds = image_ds.map(
         lambda images: tf.clip_by_value(images * 1.05, 0.0, 255.0),
         num_parallel_calls=tf.data.AUTOTUNE,
@@ -174,8 +240,8 @@ def predict_with_tta(model: tf.keras.Model, image_ds: tf.data.Dataset) -> np.nda
         lambda images: tf.clip_by_value(images * 0.95, 0.0, 255.0),
         num_parallel_calls=tf.data.AUTOTUNE,
     )
-    brighter_probabilities = model.predict(brighter_ds, verbose=0)
-    darker_probabilities = model.predict(darker_ds, verbose=0)
+    brighter_probabilities = predict_models(models, brighter_ds, primary_weight)
+    darker_probabilities = predict_models(models, darker_ds, primary_weight)
     return np.mean(
         [original_probabilities, brighter_probabilities, darker_probabilities], axis=0
     )
@@ -267,6 +333,7 @@ def build_model(backbone_name: str) -> tuple[tf.keras.Model, tf.keras.Model]:
 
 
 def main() -> None:
+    global IMAGE_SIZE, IMG_SIZE, SEED
     parser = argparse.ArgumentParser(description="교통 표지판 분류 모델 성능 개선 학습")
     parser.add_argument("--data-dir", type=Path, default=Path("data"), help="data 폴더 경로")
     parser.add_argument("--output-dir", type=Path, default=Path("outputs"), help="결과 저장 폴더")
@@ -298,6 +365,15 @@ def main() -> None:
         help="ImageNet 사전학습 특징 추출기",
     )
     parser.add_argument("--batch-size", type=int, default=64, help="배치 크기")
+    parser.add_argument("--seed", type=int, default=SEED, help="학습 재현 시드")
+    parser.add_argument(
+        "--ensemble-models", type=Path, nargs="+", default=None,
+        help="같은 클래스 순서·ROI 전처리로 학습한 추가 모델 경로(입력 크기는 달라도 됨)",
+    )
+    parser.add_argument(
+        "--ensemble-primary-weight", type=float, default=0.9,
+        help="앙상블 시 기준 모델의 확률 가중치(추가 모델은 나머지를 균등 분배)",
+    )
     parser.add_argument(
         "--fine-tune-layers", type=int, default=80,
         help="백본 미세 조정 때 마지막으로 학습할 레이어 수",
@@ -305,6 +381,10 @@ def main() -> None:
     parser.add_argument(
         "--mixup-alpha", type=float, default=0.0,
         help="학습 배치 MixUp 강도(0이면 비활성화; 보통 0.1~0.2)",
+    )
+    parser.add_argument(
+        "--class-weight-power", type=float, default=0.0,
+        help="클래스 균형 표본 가중 강도(0이면 비활성화; 0.5부터 시험 권장)",
     )
     parser.add_argument(
         "--group-validation", action="store_true",
@@ -323,6 +403,8 @@ def main() -> None:
     args = parser.parse_args()
     if args.model_path is not None and args.resume_model is not None:
         parser.error("--model-path와 --resume-model은 동시에 사용할 수 없습니다.")
+    if args.ensemble_models is not None and args.model_path is None:
+        parser.error("--ensemble-models는 --model-path와 함께 추론 전용으로 사용하세요.")
     if (
         args.epochs < 1
         or args.fine_tune_epochs < 0
@@ -330,12 +412,14 @@ def main() -> None:
         or args.batch_size < 1
         or args.fine_tune_layers < 1
         or args.mixup_alpha < 0
+        or args.class_weight_power < 0
+        or not 0.0 <= args.ensemble_primary_weight <= 1.0
     ):
         parser.error(
             "epochs와 batch-size는 1 이상, 두 fine-tune-epochs 옵션은 0 이상이어야 합니다."
         )
-    global IMAGE_SIZE, IMG_SIZE
     IMAGE_SIZE = args.image_size
+    SEED = args.seed
     IMG_SIZE = (IMAGE_SIZE, IMAGE_SIZE)
     seed_everything()
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -361,12 +445,36 @@ def main() -> None:
             return str(relative_path)
 
         groups = train["Path"].astype(str).map(recording_group)
-        splitter = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=SEED)
-        train_indices, valid_indices = next(
-            splitter.split(train, train["ClassId"], groups=groups)
-        )
+        splitter = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=2022)
+        label_values = train["ClassId"].to_numpy(dtype=np.int32)
+        full_counts = np.bincount(label_values, minlength=NUM_CLASSES)
+        candidate_splits = list(splitter.split(train, label_values, groups=groups))
+
+        def validation_split_score(split: tuple[np.ndarray, np.ndarray]) -> tuple[int, float]:
+            _, candidate_valid_indices = split
+            candidate_counts = np.bincount(
+                label_values[candidate_valid_indices], minlength=NUM_CLASSES
+            )
+            missing_classes = int(np.sum((full_counts > 0) & (candidate_counts == 0)))
+            expected_counts = full_counts * 0.2
+            class_balance_error = float(
+                np.mean(
+                    np.abs(candidate_counts[full_counts > 0] - expected_counts[full_counts > 0])
+                    / (expected_counts[full_counts > 0] + 1.0)
+                )
+            )
+            return missing_classes, class_balance_error
+
+        train_indices, valid_indices = min(candidate_splits, key=validation_split_score)
         train_df, valid_df = train.iloc[train_indices], train.iloc[valid_indices]
+        valid_classes = set(valid_df["ClassId"].unique())
+        missing_classes = sorted(set(train["ClassId"].unique()) - valid_classes)
         print("[검증] 촬영 시퀀스 그룹 분할을 적용했습니다.")
+        if missing_classes:
+            print(
+                "[경고] 검증 데이터에 포함되지 않은 클래스: "
+                + ", ".join(map(str, missing_classes))
+            )
     else:
         train_df, valid_df = train_test_split(
             train, test_size=0.2, random_state=SEED, stratify=train["ClassId"]
@@ -374,10 +482,13 @@ def main() -> None:
     print(f"[정보] 학습 이미지: {len(train_df):,}장, 검증 이미지: {len(valid_df):,}장, 테스트 이미지: {len(test):,}장")
     if args.mixup_alpha > 0:
         print(f"[증강] MixUp 사용(alpha={args.mixup_alpha:g})")
+    if args.class_weight_power > 0:
+        print(f"[균형] 클래스 표본 가중 사용(power={args.class_weight_power:g})")
 
     train_ds = make_dataset(
         train_df, args.data_dir, True, args.batch_size,
         use_roi=args.use_roi, mixup_alpha=args.mixup_alpha,
+        class_weight_power=args.class_weight_power,
     )
     valid_ds = make_dataset(
         valid_df, args.data_dir, False, args.batch_size, use_roi=args.use_roi
@@ -546,20 +657,52 @@ def main() -> None:
 
         # 모든 단계 중 검증 정확도가 가장 높았던 모델을 평가와 제출에 사용합니다.
         model = tf.keras.models.load_model(best_checkpoint)
+    inference_models = [model]
+    if args.ensemble_models:
+        for extra_model_path in args.ensemble_models:
+            if not extra_model_path.is_file():
+                parser.error(f"앙상블 모델 파일을 찾을 수 없습니다: {extra_model_path}")
+            extra_model = tf.keras.models.load_model(extra_model_path)
+            if extra_model.output_shape[-1] != NUM_CLASSES:
+                parser.error(f"앙상블 모델의 출력 클래스 수가 {NUM_CLASSES}가 아닙니다: {extra_model_path}")
+            inference_models.append(extra_model)
+        print(f"[앙상블] 총 {len(inference_models)}개 모델의 확률을 평균합니다.")
+
     result = model.evaluate(valid_ds, return_dict=True, verbose=0)
     valid_image_ds = valid_ds.map(
         lambda images, labels: images, num_parallel_calls=tf.data.AUTOTUNE
     )
-    valid_probabilities = model.predict(valid_image_ds, verbose=0)
     valid_labels = valid_df["ClassId"].to_numpy(dtype=np.int32)
+    single_model_probabilities = model.predict(valid_image_ds, verbose=0)
+    selected_models = [model]
+    selected_valid_probabilities = single_model_probabilities
+    single_model_accuracy = float(
+        np.mean(np.argmax(single_model_probabilities, axis=1) == valid_labels)
+    )
+    if len(inference_models) > 1:
+        ensemble_probabilities = predict_models(
+            inference_models, valid_image_ds, args.ensemble_primary_weight
+        )
+        ensemble_accuracy = float(
+            np.mean(np.argmax(ensemble_probabilities, axis=1) == valid_labels)
+        )
+        if ensemble_accuracy > single_model_accuracy:
+            selected_models = inference_models
+            selected_valid_probabilities = ensemble_probabilities
+        print(
+            f"[검증 앙상블] 단일 모델 {single_model_accuracy:.4%} | "
+            f"앙상블 {ensemble_accuracy:.4%} | "
+            f"테스트 적용: {'예' if len(selected_models) > 1 else '아니오'}"
+        )
     baseline_valid_accuracy = float(
-        np.mean(np.argmax(valid_probabilities, axis=1) == valid_labels)
+        np.mean(np.argmax(selected_valid_probabilities, axis=1) == valid_labels)
     )
     use_tta = False
-    selected_valid_probabilities = valid_probabilities
     tta_valid_accuracy = None
     if args.tta:
-        tta_valid_probabilities = predict_with_tta(model, valid_image_ds)
+        tta_valid_probabilities = predict_with_tta(
+            selected_models, valid_image_ds, args.ensemble_primary_weight
+        )
         tta_valid_accuracy = float(
             np.mean(np.argmax(tta_valid_probabilities, axis=1) == valid_labels)
         )
@@ -586,6 +729,8 @@ def main() -> None:
                 "baseline_validation_accuracy": baseline_valid_accuracy,
                 "tta_validation_accuracy": tta_valid_accuracy,
                 "tta_used_for_test": use_tta,
+                "ensemble_used_for_test": len(selected_models) > 1,
+                "ensemble_primary_weight": args.ensemble_primary_weight,
             },
             f,
             ensure_ascii=False,
@@ -597,7 +742,9 @@ def main() -> None:
     np.savetxt(args.output_dir / "confusion_matrix.csv", confusion_matrix(valid_df["ClassId"], valid_pred, labels=list(range(NUM_CLASSES))), fmt="%d", delimiter=",")
 
     test_probabilities = (
-        predict_with_tta(model, test_ds) if use_tta else model.predict(test_ds, verbose=0)
+        predict_with_tta(selected_models, test_ds, args.ensemble_primary_weight)
+        if use_tta
+        else predict_models(selected_models, test_ds, args.ensemble_primary_weight)
     )
     if len(test_probabilities) != len(test):
         raise RuntimeError(
