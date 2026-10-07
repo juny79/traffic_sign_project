@@ -21,11 +21,10 @@ import numpy as np
 import pandas as pd
 import tensorflow as tf
 from sklearn.metrics import classification_report, confusion_matrix
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import StratifiedGroupKFold, train_test_split
 SEED = 2022
 NUM_CLASSES = 43
 IMAGE_SIZE = 128
-FINE_TUNE_LAYERS = 40
 LABEL_SMOOTHING = 0.03
 ROI_COLUMNS = ("Roi.X1", "Roi.Y1", "Roi.X2", "Roi.Y2")
 
@@ -109,6 +108,7 @@ def make_dataset(
     training: bool,
     batch_size: int,
     use_roi: bool = False,
+    mixup_alpha: float = 0.0,
 ) -> tf.data.Dataset:
     paths = [image_path(data_dir, p) for p in frame["Path"].astype(str)]
     labels = frame["ClassId"].to_numpy(dtype=np.int32)
@@ -127,7 +127,25 @@ def make_dataset(
         )
     if training:
         ds = ds.shuffle(len(frame), seed=SEED, reshuffle_each_iteration=True)
-    return ds.batch(batch_size).prefetch(tf.data.AUTOTUNE)
+    ds = ds.batch(batch_size)
+    if training and mixup_alpha > 0:
+        alpha = tf.constant(mixup_alpha, dtype=tf.float32)
+
+        def mixup_batch(images: tf.Tensor, labels: tf.Tensor) -> tuple[tf.Tensor, tf.Tensor]:
+            batch_count = tf.shape(images)[0]
+            concentration = tf.fill([batch_count], alpha)
+            gamma_a = tf.random.gamma([], concentration)
+            gamma_b = tf.random.gamma([], concentration)
+            weights = gamma_a / (gamma_a + gamma_b + 1e-7)
+            permutation = tf.random.shuffle(tf.range(batch_count))
+            image_weights = weights[:, None, None, None]
+            label_weights = weights[:, None]
+            mixed_images = images * image_weights + tf.gather(images, permutation) * (1.0 - image_weights)
+            mixed_labels = labels * label_weights + tf.gather(labels, permutation) * (1.0 - label_weights)
+            return mixed_images, mixed_labels
+
+        ds = ds.map(mixup_batch, num_parallel_calls=tf.data.AUTOTUNE)
+    return ds.prefetch(tf.data.AUTOTUNE)
 
 
 def make_test_dataset(
@@ -209,19 +227,25 @@ class KoreanProgress(tf.keras.callbacks.Callback):
 def build_model(backbone_name: str) -> tuple[tf.keras.Model, tf.keras.Model]:
     """ImageNet 사전학습 특징 추출기와 표지판 분류 헤드를 구성합니다."""
     inputs = tf.keras.Input(shape=(*IMG_SIZE, 3))
-    x = tf.keras.layers.RandomRotation(8 / 360, fill_mode="reflect", seed=SEED)(inputs)
-    x = tf.keras.layers.RandomTranslation(0.08, 0.08, fill_mode="reflect", seed=SEED + 1)(x)
-    x = tf.keras.layers.RandomZoom((-0.12, 0.12), fill_mode="reflect", seed=SEED + 2)(x)
+    x = tf.keras.layers.RandomRotation(6 / 360, fill_mode="reflect", seed=SEED)(inputs)
+    x = tf.keras.layers.RandomTranslation(0.06, 0.06, fill_mode="reflect", seed=SEED + 1)(x)
+    x = tf.keras.layers.RandomZoom((-0.10, 0.10), fill_mode="reflect", seed=SEED + 2)(x)
     x = tf.keras.layers.RandomContrast(0.15, seed=SEED + 3)(x)
     x = tf.keras.layers.RandomBrightness(
-        0.25, value_range=(0, 255), seed=SEED + 4
+        0.18, value_range=(0, 255), seed=SEED + 4
     )(x)
+    # Keras 3 GaussianNoise expects stddev in [0, 1]; normalize temporarily so
+    # 3/255 noise corresponds to roughly three intensity levels on 8-bit pixels.
+    x = tf.keras.layers.Rescaling(1.0 / 255.0)(x)
+    x = tf.keras.layers.GaussianNoise(3.0 / 255.0, seed=SEED + 5)(x)
+    x = tf.keras.layers.Rescaling(255.0)(x)
 
     # MobileNetV3의 기본 전처리 계층이 입력 픽셀값(0~255)을 처리합니다.
     backbones = {
         "MobileNetV3Small": tf.keras.applications.MobileNetV3Small,
         "MobileNetV3Large": tf.keras.applications.MobileNetV3Large,
         "EfficientNetB0": tf.keras.applications.EfficientNetB0,
+        "EfficientNetB2": tf.keras.applications.EfficientNetB2,
     }
     base_model = backbones[backbone_name](
         input_shape=(*IMG_SIZE, 3),
@@ -266,14 +290,26 @@ def main() -> None:
         default=10,
         help="전체 백본을 초저학습률로 추가 미세 조정할 최대 회차(0이면 생략)",
     )
-    parser.add_argument("--image-size", type=int, choices=(96, 128), default=128, help="정사각형 입력 해상도")
+    parser.add_argument("--image-size", type=int, choices=(96, 128, 160, 192, 224), default=128, help="정사각형 입력 해상도")
     parser.add_argument(
         "--backbone",
-        choices=("MobileNetV3Small", "MobileNetV3Large", "EfficientNetB0"),
+        choices=("MobileNetV3Small", "MobileNetV3Large", "EfficientNetB0", "EfficientNetB2"),
         default="MobileNetV3Small",
         help="ImageNet 사전학습 특징 추출기",
     )
     parser.add_argument("--batch-size", type=int, default=64, help="배치 크기")
+    parser.add_argument(
+        "--fine-tune-layers", type=int, default=80,
+        help="백본 미세 조정 때 마지막으로 학습할 레이어 수",
+    )
+    parser.add_argument(
+        "--mixup-alpha", type=float, default=0.0,
+        help="학습 배치 MixUp 강도(0이면 비활성화; 보통 0.1~0.2)",
+    )
+    parser.add_argument(
+        "--group-validation", action="store_true",
+        help="파일명 촬영 시퀀스 단위로 학습/검증을 분리해 유사 프레임 누수를 줄임",
+    )
     parser.add_argument(
         "--use-roi",
         action="store_true",
@@ -292,6 +328,8 @@ def main() -> None:
         or args.fine_tune_epochs < 0
         or args.deep_fine_tune_epochs < 0
         or args.batch_size < 1
+        or args.fine_tune_layers < 1
+        or args.mixup_alpha < 0
     ):
         parser.error(
             "epochs와 batch-size는 1 이상, 두 fine-tune-epochs 옵션은 0 이상이어야 합니다."
@@ -313,11 +351,33 @@ def main() -> None:
     if args.use_roi:
         validate_roi_metadata(train, test)
         print("[정보] 학습·검증·테스트에 CSV ROI crop을 동일하게 적용합니다.")
-    train_df, valid_df = train_test_split(train, test_size=0.2, random_state=SEED, stratify=train["ClassId"])
+    if args.group_validation:
+        def recording_group(relative_path: str) -> str:
+            normalized = str(relative_path).replace("\\", "/")
+            path = Path(normalized)
+            tokens = path.stem.split("_")
+            if len(tokens) >= 3:
+                return f"{path.parent.as_posix()}_{tokens[1]}"
+            return str(relative_path)
+
+        groups = train["Path"].astype(str).map(recording_group)
+        splitter = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=SEED)
+        train_indices, valid_indices = next(
+            splitter.split(train, train["ClassId"], groups=groups)
+        )
+        train_df, valid_df = train.iloc[train_indices], train.iloc[valid_indices]
+        print("[검증] 촬영 시퀀스 그룹 분할을 적용했습니다.")
+    else:
+        train_df, valid_df = train_test_split(
+            train, test_size=0.2, random_state=SEED, stratify=train["ClassId"]
+        )
     print(f"[정보] 학습 이미지: {len(train_df):,}장, 검증 이미지: {len(valid_df):,}장, 테스트 이미지: {len(test):,}장")
+    if args.mixup_alpha > 0:
+        print(f"[증강] MixUp 사용(alpha={args.mixup_alpha:g})")
 
     train_ds = make_dataset(
-        train_df, args.data_dir, True, args.batch_size, use_roi=args.use_roi
+        train_df, args.data_dir, True, args.batch_size,
+        use_roi=args.use_roi, mixup_alpha=args.mixup_alpha,
     )
     valid_ds = make_dataset(
         valid_df, args.data_dir, False, args.batch_size, use_roi=args.use_roi
@@ -350,7 +410,7 @@ def main() -> None:
             parser.error("기존 모델에서 사전학습 백본을 찾지 못해 미세 조정을 진행할 수 없습니다.")
         print(f"[이어 학습] 기존 가중치에서 미세 조정을 시작합니다: {args.resume_model}")
         base_model.trainable = True
-        for layer in base_model.layers[:-FINE_TUNE_LAYERS]:
+        for layer in base_model.layers[:-args.fine_tune_layers]:
             layer.trainable = False
         for layer in base_model.layers:
             if isinstance(layer, tf.keras.layers.BatchNormalization):
@@ -424,9 +484,9 @@ def main() -> None:
 
         if args.fine_tune_epochs > 0:
             best_stage1 = model.evaluate(valid_ds, return_dict=True, verbose=0)["accuracy"]
-            print(f"[학습 2단계] 마지막 {FINE_TUNE_LAYERS}개 레이어를 낮은 학습률로 미세 조정합니다.")
+            print(f"[학습 2단계] 마지막 {args.fine_tune_layers}개 레이어를 낮은 학습률로 미세 조정합니다.")
             base_model.trainable = True
-            for layer in base_model.layers[:-FINE_TUNE_LAYERS]:
+            for layer in base_model.layers[:-args.fine_tune_layers]:
                 layer.trainable = False
             # 작은 배치에서 BN 통계를 흔들지 않도록 모든 BatchNormalization을 고정합니다.
             for layer in base_model.layers:
